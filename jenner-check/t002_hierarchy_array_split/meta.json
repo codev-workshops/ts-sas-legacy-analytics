@@ -1,0 +1,8 @@
+{
+  "bundle": "t002_hierarchy_array_split",
+  "source_file": "Programs/Parent-Child-Index.sas",
+  "source_blob_sha": "7ed0d49015f218460b9485471236d5cd54c7ad11",
+  "source_commit": "8a51b0ba4a8d26e6dc481659bdc7bdfdfb52308e",
+  "tier": "real_data",
+  "notes": "The program's hierarchy-flattening step verbatim: array Lev1-LevN walked with scan(hier,i,\"|\") and a missing forward-fill that mimics COALESCE. Fed the |-delimited hier paths the program derives for its own sample accounts."
+}

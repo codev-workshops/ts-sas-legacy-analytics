@@ -1,0 +1,18 @@
+
+      ACCT_NAME  ACCT  PARENT  AMOUNT
+---------------  ----  ------  ------
+Newcastle        A3    A2          30
+New Delhi        A9    A7          30
+Roganjosh        A10   A9          20
+New South Wales  A2    A1          20
+Sydney           A4    A2          20
+Chennai          A8    A7          20
+IBM Australia    A1                10
+Victoria         A5    A1          10
+Melbourne        A6    A5          10
+HP India         A7                10
+CBD              A11   A4           5
+Vindaloo         A12   A9           5
+Pitt St. Branch  A13   A11          5
+Korma            A14   A12          5
+

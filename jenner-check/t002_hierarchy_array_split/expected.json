@@ -1,0 +1,20 @@
+{
+  "_captured_at": "2026-06-11T18:41:22Z",
+  "_captured_run_id": "r_019eb7fd2a5b7931ba6787859eb415e0",
+  "status": "ok",
+  "exit_code": 0,
+  "log_contains": [
+    "NOTE: Wrote option2 (10 rows, 2 columns).",
+    "NOTE: Read 10 rows from option2.",
+    "NOTE: Wrote dim_acct (10 rows, 4 columns).",
+    "NOTE: PROC PRINT completed: 10 observations printed, 4 variables"
+  ],
+  "log_does_not_contain": [
+    "ERROR:",
+    "[JENNER-ERROR"
+  ],
+  "diagnostics": {
+    "parse_warnings": [],
+    "runtime_warnings": []
+  }
+}
