@@ -1,0 +1,82 @@
+1          /*=====================================================================
+2            autoexec.sas loaded
+3          =====================================================================*/
+4
+NOTE: ========================================
+NOTE: autoexec.sas loaded successfully
+NOTE: Environment: PROD
+NOTE: Date: 15JAN2024
+NOTE: Reporting Period: 202312
+NOTE: ========================================
+5
+6          %include "/opt/sas/custom/programs/Banking/daily_transaction_processing.sas";
+
+NOTE: ============================================
+NOTE: daily_transaction_processing started
+NOTE: Transaction Date: 15JAN2024
+NOTE: Source Dataset: RAW_BANK.TXN_FEED_20240115
+NOTE: ============================================
+
+NOTE: Feed record count: 2341567
+
+7          data WORK.TXN_VALIDATED WORK.TXN_REJECTED;
+NOTE: There were 2341567 observations read from the data set RAW_BANK.TXN_FEED_20240115.
+NOTE: The data set WORK.TXN_VALIDATED has 2338912 observations and 18 columns.
+NOTE: The data set WORK.TXN_REJECTED has 2655 observations and 19 columns.
+NOTE: DATA statement used (Total process time):
+      real time           1:12.34
+      cpu time            0:58.67
+
+NOTE: Validated: 2338912 of 2341567
+
+8          proc sql;
+NOTE: Table WORK.TXN_ENRICHED created, with 2338912 rows and 25 columns.
+9          quit;
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           3:45.12
+      cpu time            2:56.78
+
+10         proc sql;
+NOTE: Table WORK.TXN_STATS created, with 423891 rows and 4 columns.
+11         quit;
+
+12         proc sql;
+NOTE: Table WORK.TXN_ANOMALIES created, with 3421 rows and 28 columns.
+13         quit;
+NOTE: Anomalies detected: 3421
+
+14         proc append base=CURATED.DAILY_TRANSACTIONS data=WORK.TXN_ENRICHED force;
+NOTE: 2338912 observations added.
+NOTE: The data set CURATED.DAILY_TRANSACTIONS has 67234891 observations.
+NOTE: PROCEDURE APPEND used (Total process time):
+      real time           0:45.23
+      cpu time            0:34.56
+
+15         proc append base=CURATED.TXN_ANOMALIES data=WORK.TXN_ANOMALIES force;
+NOTE: 3421 observations added.
+
+16         data CURATED.RUNNING_BALANCES;
+NOTE: There were 2338912 observations read from the data set WORK.TXN_ENRICHED.
+NOTE: The data set CURATED.RUNNING_BALANCES has 2338912 observations and 27 columns.
+NOTE: DATA statement used (Total process time):
+      real time           0:52.89
+      cpu time            0:41.23
+
+NOTE: ============================================
+NOTE: daily_transaction_processing completed
+NOTE: Feed: 2341567 | Valid: 2338912 | Anomalies: 3421
+NOTE: Duration: 0:06:48
+NOTE: ============================================
+
+17         proc datasets lib=WORK nolist;
+NOTE: Deleting WORK.TXN_VALIDATED (memtype=DATA).
+NOTE: Deleting WORK.TXN_REJECTED (memtype=DATA).
+NOTE: Deleting WORK.TXN_ENRICHED (memtype=DATA).
+NOTE: Deleting WORK.TXN_STATS (memtype=DATA).
+NOTE: Deleting WORK.TXN_ANOMALIES (memtype=DATA).
+18         quit;
+
+NOTE: SAS Institute Inc., SAS Campus Drive, Cary, NC USA 27513-2414
+NOTE: The SAS System used:
+      real time           6:48.58
+      cpu time            5:11.24

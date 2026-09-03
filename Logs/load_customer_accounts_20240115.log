@@ -1,0 +1,66 @@
+1          /*=====================================================================
+2            autoexec.sas loaded
+3          =====================================================================*/
+4
+NOTE: ========================================
+NOTE: autoexec.sas loaded successfully
+NOTE: Environment: PROD
+NOTE: Date: 15JAN2024
+NOTE: Reporting Period: 202312
+NOTE: ========================================
+5
+6          %include "/opt/sas/custom/programs/Banking/load_customer_accounts.sas";
+
+NOTE: ============================================
+NOTE: load_customer_accounts started
+NOTE: Run Date: 15JAN2024
+NOTE: Region Filter: ALL
+NOTE: ============================================
+
+7          proc sql;
+NOTE: Table WORK.ACCT_RAW created, with 847293 rows and 22 columns.
+8          quit;
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           2:14.38
+      cpu time            1:48.92
+
+NOTE: Raw extract rows: 847293
+
+9          data STG_BANK.CUST_ACCOUNTS_DAILY WORK.ACCT_EXCEPTIONS;
+NOTE: There were 847293 observations read from the data set WORK.ACCT_RAW.
+NOTE: The data set STG_BANK.CUST_ACCOUNTS_DAILY has 847293 observations and 30 columns.
+NOTE: The data set WORK.ACCT_EXCEPTIONS has 1247 observations and 24 columns.
+NOTE: DATA statement used (Total process time):
+      real time           0:32.17
+      cpu time            0:28.45
+
+WARNING: 1247 data quality exceptions found
+
+10         proc sql;
+NOTE: 1247 rows were inserted into STG_BANK.ACCT_EXCEPTIONS.
+11         quit;
+
+12         proc means data=STG_BANK.CUST_ACCOUNTS_DAILY noprint nway;
+NOTE: There were 847293 observations read from the data set STG_BANK.CUST_ACCOUNTS_DAILY.
+NOTE: The data set WORK.ACCT_SUMMARY has 42 observations and 8 columns.
+NOTE: PROCEDURE MEANS used (Total process time):
+      real time           0:08.21
+      cpu time            0:06.89
+
+NOTE: ============================================
+NOTE: load_customer_accounts completed
+NOTE: Records loaded: 847293
+NOTE: Exceptions: 1247
+NOTE: Duration: 0:02:55
+NOTE: ============================================
+
+13         proc datasets lib=WORK nolist;
+NOTE: Deleting WORK.ACCT_RAW (memtype=DATA).
+NOTE: Deleting WORK.ACCT_EXCEPTIONS (memtype=DATA).
+NOTE: Deleting WORK.ACCT_SUMMARY (memtype=DATA).
+14         quit;
+
+NOTE: SAS Institute Inc., SAS Campus Drive, Cary, NC USA 27513-2414
+NOTE: The SAS System used:
+      real time           2:55.76
+      cpu time            2:24.26

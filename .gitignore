@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+# SAS run artifacts
+*.sas7bdat
+*.sas7bndx
+*.log
+*.lst
+!Logs/*.log
