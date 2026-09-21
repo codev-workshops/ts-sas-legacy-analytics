@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# run-banking — run the banking estate end to end inside the container and
+# leave a reviewable trail under $SAS_DATA_ROOT:
+#
+#   logs/run_local_banking.log   full SAS log (formats -> seed load -> env overrides -> 4 programs)
+#   logs/export_golden.log       log of the golden export
+#   golden/*.csv                 every output table + row_counts.csv + controls.csv
+#   golden/manifest.json         what ran, when, from which commit, and the counts
+#
+# Exit status: 0 only if the interpreter returned 0 AND the log has no ERROR,
+# UNSUPPORTED or unresolved-macro line, AND row_counts.csv matches
+# docker/expected/row_counts.csv. Business WARNINGs (e.g. data-quality
+# exceptions) are expected and do not fail the run.
+#
+# Every run starts from an empty $SAS_DATA_ROOT (the seed loader rebuilds all
+# libraries) so a re-run on a persistent volume cannot double-append into the
+# CURATED history tables the programs accumulate into.
+#
+#   run-banking            full run
+#   run-banking --keep     full run on top of whatever is already in $SAS_DATA_ROOT
+#   run-banking --check    re-scan the last log without re-running
+set -uo pipefail
+
+REPO_ROOT="${SAS_REPO_ROOT:-/opt/sas/custom}"
+DATA_ROOT="${SAS_DATA_ROOT:-/data/sas}"
+GOLDEN_ROOT="${SAS_GOLDEN_ROOT:-$DATA_ROOT/golden}"
+EXPECTED="$REPO_ROOT/docker/expected/row_counts.csv"
+LOG="$DATA_ROOT/logs/run_local_banking.log"
+EXPORT_LOG="$DATA_ROOT/logs/export_golden.log"
+export SAS_REPO_ROOT="$REPO_ROOT" SAS_DATA_ROOT="$DATA_ROOT" SAS_GOLDEN_ROOT="$GOLDEN_ROOT"
+
+check_log() {
+  local log="$1" bad
+  bad="$(grep -nE '^ERROR|UNSUPPORTED|Apparent (invocation of macro|symbolic reference) .* not resolved' "$log" || true)"
+  if [ -n "$bad" ]; then
+    echo "run-banking: $log has failures:" >&2
+    echo "$bad" | head -20 >&2
+    return 1
+  fi
+  return 0
+}
+
+if [ "${1:-}" = "--check" ]; then
+  check_log "$LOG" && check_log "$EXPORT_LOG" && echo "run-banking: logs clean"
+  exit $?
+fi
+
+if [ "${1:-}" != "--keep" ]; then
+  find "$DATA_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  sas-entrypoint.sh true   # recreate the empty library tree
+fi
+mkdir -p "$DATA_ROOT/logs" "$GOLDEN_ROOT"
+started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+echo "run-banking: estate=$REPO_ROOT data=$DATA_ROOT"
+sas -nodms -noterminal \
+    -autoexec "$REPO_ROOT/Config/autoexec_local.sas" \
+    -set SAS_REPO_ROOT "$REPO_ROOT" \
+    -set SAS_DATA_ROOT "$DATA_ROOT" \
+    -sysin "$REPO_ROOT/docker/sas/run_banking.sas" \
+    -log "$LOG" \
+    -print "$DATA_ROOT/logs/run_local_banking.lst" > /dev/null
+rc=$?
+echo "run-banking: pipeline rc=$rc log=$LOG"
+[ "$rc" -eq 0 ] || exit "$rc"
+check_log "$LOG" || exit 1
+
+sas -nodms -noterminal \
+    -autoexec "$REPO_ROOT/Config/autoexec_local.sas" \
+    -sysin "$REPO_ROOT/docker/sas/export_golden.sas" \
+    -log "$EXPORT_LOG" > /dev/null
+rc=$?
+[ "$rc" -eq 0 ] || { echo "run-banking: golden export rc=$rc log=$EXPORT_LOG" >&2; exit "$rc"; }
+check_log "$EXPORT_LOG" || exit 1
+
+# manifest.json: enough provenance for the migration side to trust the files.
+commit="$(cat "$REPO_ROOT/.estate-commit" 2>/dev/null || echo unknown)"
+{
+  echo '{'
+  echo "  \"estate\": \"ts-sas-legacy-analytics\","
+  echo "  \"estate_commit\": \"$commit\","
+  echo "  \"runtime\": \"opensas (container)\","
+  echo "  \"business_date\": \"$(grep -oE 'Business Date: [0-9A-Z]+' "$LOG" | head -1 | cut -d' ' -f3)\","
+  echo "  \"started_utc\": \"$started\","
+  echo "  \"finished_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+  echo "  \"warnings\": $(grep -c '^WARNING' "$LOG"),"
+  echo '  "row_counts": {'
+  tail -n +2 "$GOLDEN_ROOT/row_counts.csv" | tr -d '"\r' | awk -F, 'NR>1{printf ",\n"}{printf "    \"%s\": %s", $1, $2}'
+  echo
+  echo '  }'
+  echo '}'
+} > "$GOLDEN_ROOT/manifest.json"
+
+echo "run-banking: golden outputs -> $GOLDEN_ROOT"
+cat "$GOLDEN_ROOT/row_counts.csv"
+
+if [ -f "$EXPECTED" ]; then
+  if diff <(tr -d '"\r' < "$EXPECTED") <(tr -d '"\r' < "$GOLDEN_ROOT/row_counts.csv") > "$DATA_ROOT/logs/row_counts.diff"; then
+    echo "run-banking: row counts match $EXPECTED"
+  else
+    echo "run-banking: row counts DIFFER from $EXPECTED:" >&2
+    cat "$DATA_ROOT/logs/row_counts.diff" >&2
+    exit 1
+  fi
+fi

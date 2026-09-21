@@ -1,0 +1,983 @@
+From 587ac65ad9b5a8c8bbb6adde0ed49cb7549e9bc9 Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 01:48:40 +0000
+Subject: [PATCH 1/4] =?UTF-8?q?dev:=20DONE=20BUG-sqljoinonsubq/sqlrowwiseh?=
+ =?UTF-8?q?avingcalc/meansoutfewer=20=E2=80=94=20PROC=20SQL=20ON=20scalar?=
+ =?UTF-8?q?=20subquery,=20row-wise=20HAVING=20binds=20aliases,=20CALCULATE?=
+ =?UTF-8?q?D=20in=20CASE,=20MEANS=20OUTPUT=20fewer=20names,=20dataset=20la?=
+ =?UTF-8?q?bel=3D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/io.zig   |  10 +++
+ src/proc.zig |  25 ++++--
+ src/sql.zig  | 235 +++++++++++++++++++++++++++++++++++++++++++++++----
+ 3 files changed, 249 insertions(+), 21 deletions(-)
+
+diff --git a/src/io.zig b/src/io.zig
+index 71b9c96..a950c12 100644
+--- a/src/io.zig
++++ b/src/io.zig
+@@ -2089,6 +2089,16 @@ pub fn applyDatasetOptionsObs(a: std.mem.Allocator, ds: *Dataset, opt_toks: []co
+         } else if (eqiTok(key, "in")) {
+             // Single-token value, consumed by exec.inVarOf.
+             if (i < opt_toks.len) i += 1;
++        } else if (eqiTok(key, "label")) {
++            // label='text': the dataset label. Stored on OUTPUT (round-trips
++            // through the .labels sidecar); accepted and ignored on INPUT.
++            if (i < opt_toks.len and opt_toks[i].tag == .string) {
++                if (!input) ds.label = try a.dupe(u8, opt_toks[i].text);
++                i += 1;
++            } else {
++                try diags.report(.err, 0, "dataset option label= requires a quoted string", .{});
++                return;
++            }
+         } else {
+             // BUG-wheredsoptswallow: a misspelled or unimplemented option used
+             // to fall through this chain and vanish — `set d(wehre=(x>2))`
+diff --git a/src/proc.zig b/src/proc.zig
+index 93880a5..d6f974c 100644
+--- a/src/proc.zig
++++ b/src/proc.zig
+@@ -1643,18 +1643,21 @@ pub fn runMeans(cx: ProcCtx, out: *std.ArrayList(u8), toks: []const Token) diag.
+                 }
+                 continue;
+             }
+-            // SAS errors when the name count ≠ the analysis-var count (the explicit
++            // SAS errors when MORE names than analysis vars are given (the explicit
+             // (varlist), else every VAR var) — the old @min clamp silently dropped
+             // vars / cloned values into duplicate columns (BUG-meansoutnamecount).
++            // FEWER names is legal: the remaining vars keep their default output
++            // name (analysis-variable name, or var_Stat under /AUTONAME).
+             const nvars: usize = if (g.evars.len > 0) g.evars.len else acols.items.len;
+-            if (g.names.len != nvars)
++            if (g.names.len > nvars)
+                 return diags.fail(error.ParseError, 0, "PROC MEANS: OUTPUT: {d} name(s) given for {d} analysis variable(s)", .{ g.names.len, nvars });
+-            for (g.names, 0..) |nm, k| {
++            for (0..nvars) |k| {
+                 const acol: usize = if (g.evars.len > 0)
+                     (ds.indexOf(g.evars[k]) orelse
+                         return diags.fail(error.ParseError, 0, "PROC MEANS: OUTPUT variable {s} not in {s}", .{ g.evars[k], ds.name }))
+                 else
+                     acols.items[k];
++                const nm: []const u8 = if (k < g.names.len) g.names[k] else try outStatName(arena, ds.columns.items[acol].name, g.stat, os.autoname);
+                 try os.stats.append(arena, .{ .stat = g.stat, .name = nm, .acol = acol });
+             }
+         }
+@@ -13733,10 +13736,8 @@ test "BUG-meansoutdupname/meansoutnamecount: OUTPUT dup names + name-count misma
+         try t.expect(std.mem.indexOf(u8, try diags.render(), "duplicate column name x in OUTPUT OUT=od") != null);
+         try t.expect(lib.find("od") == null); // no broken dataset produced
+     }
+-    // (b) name count ≠ var count: fewer names silently dropped vars, more names
+-    // cloned a value into duplicate columns — both must fail loud.
++    // (b) more names than vars cloned a value into duplicate columns — fail loud.
+     for ([_][]const u8{
+-        "proc means data=d noprint; var x y; output out=oc mean=m; run;", // 1 name, 2 vars
+         "proc means data=d noprint; var x y; output out=oc mean=a b c; run;", // 3 names, 2 vars
+     }) |src| {
+         var diags = diag.Diagnostics.init(a);
+@@ -13746,6 +13747,18 @@ test "BUG-meansoutdupname/meansoutnamecount: OUTPUT dup names + name-count misma
+         try t.expect(std.mem.indexOf(u8, try diags.render(), "name(s) given for") != null);
+         try t.expect(lib.find("oc") == null);
+     }
++    // (b2) fewer names than vars: the unnamed vars fall back to the documented
++    // default output name — the analysis variable name (SAS 9.4 OUTPUT statement,
++    // name(s) Default) — so `var x y; mean=m` yields columns m and y.
++    {
++        var diags = diag.Diagnostics.init(a);
++        var out: std.ArrayList(u8) = .empty;
++        const toks = try lex.tokenize(a, "proc means data=d noprint; var x y; output out=of mean=m; run;", &diags);
++        try runMeans(.{ .arena = a, .lib = &lib, .diags = &diags }, &out, toks);
++        const of = lib.find("of").?;
++        try t.expect(of.indexOf("m") != null);
++        try t.expect(of.indexOf("y") != null);
++    }
+     // (c) baselines stay green: properly-named stats, matched counts, AUTONAME.
+     for ([_][]const u8{
+         "proc means data=d noprint; var x; output out=ok1 mean=m std=s; run;",
+diff --git a/src/sql.zig b/src/sql.zig
+index cda7484..d509e39 100644
+--- a/src/sql.zig
++++ b/src/sql.zig
+@@ -2004,10 +2004,24 @@ fn parseQuery(arena: std.mem.Allocator, toks: []const Token) !Query {
+             if (!(atKw(toks, i, "on"))) return error.ParseError;
+             i += 1;
+             const s = i;
+-            while (i < toks.len and !tkKw(toks[i], "where") and !tkKw(toks[i], "group") and
+-                !tkKw(toks[i], "order") and !tkKw(toks[i], "inner") and !tkKw(toks[i], "left") and
+-                !tkKw(toks[i], "right") and !tkKw(toks[i], "full") and
+-                !tkKw(toks[i], "cross") and !tkKw(toks[i], "join") and toks[i].tag != .comma) i += 1;
++            // clause keywords inside a parenthesized `(select … where …)`
++            // subquery belong to the subquery, not to the outer query
++            var on_depth: usize = 0;
++            while (i < toks.len) : (i += 1) {
++                if (toks[i].tag == .lparen) {
++                    on_depth += 1;
++                    continue;
++                }
++                if (toks[i].tag == .rparen) {
++                    on_depth -|= 1;
++                    continue;
++                }
++                if (on_depth > 0) continue;
++                if (tkKw(toks[i], "where") or tkKw(toks[i], "group") or tkKw(toks[i], "having") or
++                    tkKw(toks[i], "order") or tkKw(toks[i], "inner") or tkKw(toks[i], "left") or
++                    tkKw(toks[i], "right") or tkKw(toks[i], "full") or
++                    tkKw(toks[i], "cross") or tkKw(toks[i], "join") or toks[i].tag == .comma) break;
++            }
+             on = toks[s..i];
+         }
+         try joins.append(arena, .{ .kind = kind, .table = tn, .alias = talias, .on = on, .from_sub = sub, .opts = topts });
+@@ -3597,11 +3611,105 @@ fn buildJoin(arena: std.mem.Allocator, lib: *Library, diags: *diag.Diagnostics,
+         if (step.kind == .cross and step.on == null) {
+             if (where) |wt| step.on = try commaStepOn(arena, acc, t2, step.alias orelse step.table, wt);
+         }
+-        acc = (try joinTwo(arena, diags, acc, step, t2)) orelse return null;
++        // An ON that carries a `(select …)` scalar subquery correlated to the
++        // joined-in table (`on a.k = b.k and b.d = (select max(d) from T where
++        // k = b.k)`) — pre-resolve the subquery once per t2 row into a hidden
++        // column so the ON becomes a plain expression joinTwo can evaluate.
++        var t2j = t2;
++        var hidden: usize = 0;
++        if (step.on) |ot| if (hasSubquery(ot)) {
++            const r = (try resolveOnSubqueries(arena, lib, diags, acc, t2, &step)) orelse return null;
++            t2j = r.ds;
++            hidden = r.hidden;
++        };
++        acc = (try joinTwo(arena, diags, acc, step, t2j)) orelse return null;
++        if (hidden > 0) acc = try dropTrailingColumns(arena, acc, hidden);
+     }
+     return acc;
+ }
+ 
++const OnSubqResolved = struct { ds: *Dataset, hidden: usize };
++
++/// Evaluate every `(select …)` in `step.on` once per row of `t2` and store the
++/// value in a hidden trailing column `_sq<k>_` of a copy of `t2`; rewrite the
++/// ON to reference `<t2q>._sq<k>_` instead. Only subqueries correlated to the
++/// joined-in table (or uncorrelated) are supported — one that reads the LEFT
++/// side would need per-pair evaluation and fails loud.
++fn resolveOnSubqueries(arena: std.mem.Allocator, lib: *Library, diags: *diag.Diagnostics, acc: *Dataset, t2: *Dataset, step: *JoinStep) diag.Error!?OnSubqResolved {
++    const ot = step.on.?;
++    const t2q = step.alias orelse step.table;
++    const t2x = try arena.create(Dataset);
++    t2x.* = Dataset.init(arena, t2.name);
++    for (t2.columns.items) |c| _ = try t2x.addColumnLike(c.name, c);
++    var cells_per_row: std.ArrayList(std.ArrayList(Value)) = .empty;
++    for (t2.rows.items) |r| {
++        var cells: std.ArrayList(Value) = .empty;
++        try cells.appendSlice(arena, r);
++        try cells_per_row.append(arena, cells);
++    }
++    var on_out: std.ArrayList(Token) = .empty;
++    var k: usize = 0;
++    var i: usize = 0;
++    while (i < ot.len) {
++        if (!(ot[i].tag == .lparen and atKw(ot, i + 1, "select"))) {
++            try on_out.append(arena, ot[i]);
++            i += 1;
++            continue;
++        }
++        var depth: usize = 1;
++        var j = i + 1;
++        while (j < ot.len) : (j += 1) {
++            if (ot[j].tag == .lparen) depth += 1 else if (ot[j].tag == .rparen) {
++                depth -= 1;
++                if (depth == 0) break;
++            }
++        }
++        const sub = ot[i .. j + 1];
++        // A reference to a LEFT-side qualified column inside the subquery
++        // would need one subquery run per (left,right) pair — not supported.
++        for (ot[i + 1 .. j]) |tk| {
++            if (tk.tag != .name) continue;
++            const d = std.mem.indexOfScalar(u8, tk.text, '.') orelse continue;
++            if (eqi(tk.text[0..d], t2q)) continue;
++            if (acc.indexOf(tk.text) != null) {
++                unsupported("PROC SQL: JOIN ON subquery references the left side of the join");
++                return null;
++            }
++        }
++        const colname = try std.fmt.allocPrint(arena, "_sq{d}_", .{k});
++        k += 1;
++        var ty: ?VarType = null;
++        for (t2.rows.items, 0..) |_, ri| {
++            const lit = try substituteSubqueries(arena, lib, diags, sub, .{ .ds = t2, .ri = ri, .table = step.table, .alias = step.alias });
++            if (lit.len != 1) return diags.fail(error.ParseError, ot[i].line, "PROC SQL: JOIN ON subquery did not reduce to a scalar", .{});
++            const v: Value = switch (lit[0].tag) {
++                .dot => Value.missing,
++                .number => .{ .num = sasParseFloat(lit[0].text) orelse std.math.nan(f64) },
++                .string => .{ .str = lit[0].text },
++                else => return diags.fail(error.ParseError, ot[i].line, "PROC SQL: JOIN ON subquery did not reduce to a scalar", .{}),
++            };
++            if (ty == null and lit[0].tag != .dot) ty = if (v == .str) .char else .num;
++            try cells_per_row.items[ri].append(arena, v);
++        }
++        _ = try t2x.addColumn(colname, ty orelse .num);
++        try on_out.append(arena, .{ .tag = .name, .text = try std.fmt.allocPrint(arena, "{s}.{s}", .{ t2q, colname }), .line = ot[i].line });
++        i = j + 1;
++    }
++    for (cells_per_row.items) |cells| try t2x.rows.append(arena, cells.items);
++    step.on = on_out.items;
++    return .{ .ds = t2x, .hidden = k };
++}
++
++/// Project `ds` without its last `n` columns (the hidden `_sq<k>_` helpers).
++fn dropTrailingColumns(arena: std.mem.Allocator, ds: *Dataset, n: usize) !*Dataset {
++    const keep = ds.columns.items.len - n;
++    const out = try arena.create(Dataset);
++    out.* = Dataset.init(arena, ds.name);
++    for (ds.columns.items[0..keep]) |c| _ = try out.addColumnLike(c.name, c);
++    for (ds.rows.items) |r| try out.rows.append(arena, r[0..keep]);
++    return out;
++}
++
+ /// Join the accumulated (already-qualified) result with one more table.
+ fn joinTwo(arena: std.mem.Allocator, diags: *diag.Diagnostics, acc: *Dataset, step: JoinStep, t2: *Dataset) !?*Dataset {
+     const joined = try arena.create(Dataset);
+@@ -4770,21 +4878,17 @@ fn execStarRemerge(arena: std.mem.Allocator, lib: *Library, ds: *Dataset, diags:
+     return res;
+ }
+ 
+-fn execRowWise(arena: std.mem.Allocator, lib: *Library, ds: *Dataset, diags: *diag.Diagnostics, q: Query, kept_in: []const usize) !Result {
++fn execRowWise(arena: std.mem.Allocator, lib: *Library, ds: *Dataset, diags: *diag.Diagnostics, q: Query, kept: []const usize) !Result {
+     // BUG-sqlhavingnogroup: a HAVING with no aggregate of its own routes here
+     // (has_agg false — an aggregate inside a `(select …)` subquery is the
+     // subquery's own, exprHasAgg skips it) and was silently DROPPED, returning
+     // every row. Apply it per row via the shared HAVING evaluator, mirroring
+     // execStarRemerge: the whole kept set is one group, rep = this row.
++    // It runs AFTER this row's SELECT items are computed, with them bound under
++    // their alias, so `having <case-alias> ne ''` sees the CASE value and not an
++    // unbound (missing) name that let every row through.
+     // ponytail: fresh PDV per row inside evalHaving — same cost class as the
+     // star+having path; hoist only if a big-table no-agg HAVING profiles hot.
+-    var kept = kept_in;
+-    if (q.having) |htoks| {
+-        var f: std.ArrayList(usize) = .empty;
+-        for (kept_in) |ri|
+-            if (try evalHaving(arena, lib, diags, ds, htoks, kept_in, ri, &.{}, &.{})) try f.append(arena, ri);
+-        kept = f.items;
+-    }
+     var cols: std.ArrayList(OutCol) = .empty;
+     if (q.star) {
+         for (ds.columns.items) |c| try cols.append(arena, passCol(c.name, c)); // GH#49: pass-through keeps format; + its declared LENGTH (BUG-sqlcolwidthloss)
+@@ -4833,6 +4937,11 @@ fn execRowWise(arena: std.mem.Allocator, lib: *Library, ds: *Dataset, diags: *di
+     }
+     var pkb: std.ArrayList(u8) = .empty; // reused scalar-probe key buffer
+ 
++    // HAVING binds each SELECT item under its output name; the value's type governs.
++    const hcols = try arena.alloc(OutCol, q.items.len);
++    for (names, ilens, 0..) |nm, ln, k| hcols[k] = .{ .name = nm, .type = .num, .len = ln };
++    var hkept: std.ArrayList(usize) = .empty; // ds rows that survived HAVING, in kept order
++
+     var pdv = Pdv.init(arena);
+     var ev: eval.Evaluator = .{ .arena = arena, .pdv = &pdv, .diags = diags, .call_fn = &sqlDispatch };
+     for (kept) |ri| {
+@@ -4860,7 +4969,10 @@ fn execRowWise(arena: std.mem.Allocator, lib: *Library, ds: *Dataset, diags: *di
+             // under the SAME width its output column will carry (BUG-sqlcolwidthloss)
+             try bindCol(&pdv, names[k], if (cells[k] == .num) .num else .char, ilens[k], cells[k]);
+         }
++        if (q.having) |htoks|
++            if (!try evalHaving(arena, lib, diags, ds, htoks, kept, ri, hcols, cells)) continue;
+         try rows.append(arena, cells);
++        try hkept.append(arena, ri);
+     }
+ 
+     // column types: a plain column follows its source; a computed column follows
+@@ -4881,7 +4993,7 @@ fn execRowWise(arena: std.mem.Allocator, lib: *Library, ds: *Dataset, diags: *di
+     }
+ 
+     var res = Result{ .cols = try cols.toOwnedSlice(arena), .rows = try rows.toOwnedSlice(arena) };
+-    try orderRows(arena, diags, &res, q.order, null, .{ .ds = ds, .rows = kept });
++    try orderRows(arena, diags, &res, q.order, null, .{ .ds = ds, .rows = hkept.items });
+     return res;
+ }
+ 
+@@ -5011,7 +5123,9 @@ fn armTypeBit(ev: *eval.Evaluator, toks: []const Token) u2 {
+ 
+ /// Evaluate one arm span: resolve any nested CASE to a literal, then parse & eval.
+ fn evalSpan(arena: std.mem.Allocator, diags: *diag.Diagnostics, ev: *eval.Evaluator, toks: []const Token) diag.Error!Value {
+-    const resolved = try substituteCase(arena, diags, ev, toks);
++    // `calculated <alias>` inside a CASE arm / WHEN condition: the alias is
++    // already bound in the PDV, so the marker is dropped just as evalExprItem does.
++    const resolved = try substituteCase(arena, diags, ev, try removeCalculated(arena, toks));
+     var p = pe.Parser.init(arena, try withEof(arena, resolved), diags);
+     const expr = p.parseExpr() catch return Value.missing;
+     return ev.eval(expr);
+@@ -9498,3 +9612,94 @@ test "GAP-sqlsortseqlinguistic: ORDER BY honours SORTSEQ=LINGUISTIC; statement o
+     runSql(a, &lib, &dt, "proc sql sortseqq=x; select name from t; quit;") catch {};
+     try t.expect(std.mem.indexOf(u8, try dt.render(), "unrecognized option sortseqq") != null);
+ }
++
++test "BUG-sqlrowwisehavingcalc: no-agg HAVING sees the row's SELECT aliases; CALCULATED inside a CASE arm resolves" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var lib = Library.init(a);
++    const d = try a.create(Dataset);
++    d.* = Dataset.init(a, "d");
++    _ = try d.addColumn("x", .num);
++    _ = try d.addColumn("y", .char);
++    try d.appendRow(&.{ numV(1), strV("a") });
++    try d.appendRow(&.{ numV(5), strV("b") });
++    try d.appendRow(&.{ numV(9), strV("c") });
++    try lib.put("d", d);
++    var diags = diag.Diagnostics.init(a);
++    try runSql(a, &lib, &diags,
++        \\proc sql; create table o as
++        \\ select x, y, x*2 as dbl,
++        \\   case when calculated dbl > 5 then 'BIG' else '' end as tag length=5
++        \\ from d having tag ne '' order by x desc; quit;
++    );
++    try t.expect(!diags.hasErrors());
++    const o = lib.find("o").?;
++    // rows x=5 (dbl 10) and x=9 (dbl 18) carry tag BIG; x=1 is filtered out
++    try t.expectEqual(@as(usize, 2), o.rows.items.len);
++    try t.expectEqual(@as(f64, 9), o.row(0)[0].num);
++    try t.expectEqual(@as(f64, 5), o.row(1)[0].num);
++    try t.expectEqualStrings("BIG", o.row(0)[o.indexOf("tag").?].str);
++    // a HAVING directly after a JOIN … ON must end the ON clause, not be swallowed by it
++    const s = try a.create(Dataset);
++    s.* = Dataset.init(a, "s");
++    _ = try s.addColumn("x", .num);
++    _ = try s.addColumn("m", .num);
++    try s.appendRow(&.{ numV(1), numV(100) });
++    try s.appendRow(&.{ numV(5), numV(200) });
++    try lib.put("s", s);
++    var diags2 = diag.Diagnostics.init(a);
++    try runSql(a, &lib, &diags2,
++        \\proc sql; create table o2 as
++        \\ select e.*, s.m, case when e.x > 4 then 'BIG' else '' end as tag length=5
++        \\ from d e left join s on e.x = s.x
++        \\ having tag ne ''; quit;
++    );
++    try t.expect(!diags2.hasErrors());
++    const o2 = lib.find("o2").?;
++    try t.expectEqual(@as(usize, 2), o2.rows.items.len);
++    try t.expectEqual(@as(f64, 200), o2.row(0)[o2.indexOf("m").?].num);
++    try t.expect(o2.row(1)[o2.indexOf("m").?].isMissing());
++}
++
++test "BUG-sqljoinonsubq: JOIN ON with a scalar subquery correlated to the joined table" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var lib = Library.init(a);
++    const l = try a.create(Dataset);
++    l.* = Dataset.init(a, "a");
++    _ = try l.addColumn("k", .char);
++    _ = try l.addColumn("v", .num);
++    try l.appendRow(&.{ strV("c1"), numV(10) });
++    try l.appendRow(&.{ strV("c2"), numV(20) });
++    try l.appendRow(&.{ strV("c3"), numV(30) });
++    try lib.put("a", l);
++    const r = try a.create(Dataset);
++    r.* = Dataset.init(a, "b");
++    _ = try r.addColumn("k", .char);
++    _ = try r.addColumn("d", .num);
++    _ = try r.addColumn("s", .num);
++    try r.appendRow(&.{ strV("c1"), numV(1), numV(600) });
++    try r.appendRow(&.{ strV("c1"), numV(2), numV(650) });
++    try r.appendRow(&.{ strV("c1"), numV(5), numV(700) });
++    try r.appendRow(&.{ strV("c2"), numV(1), numV(500) });
++    try r.appendRow(&.{ strV("c2"), numV(4), numV(550) });
++    try lib.put("b", r);
++    var diags = diag.Diagnostics.init(a);
++    // the `where` inside the ON subquery must not end the ON clause early
++    try runSql(a, &lib, &diags,
++        \\proc sql; create table j as
++        \\ select a.k, a.v, bb.d, bb.s from a left join b bb
++        \\   on a.k = bb.k and bb.d = (select max(d) from b where k = bb.k and d <= 4)
++        \\ order by a.k; quit;
++    );
++    try t.expect(!diags.hasErrors());
++    const j = lib.find("j").?;
++    try t.expectEqual(@as(usize, 3), j.rows.items.len);
++    try t.expectEqual(@as(usize, 4), j.columns.items.len); // hidden _sq0_ column dropped
++    const si = j.indexOf("s").?;
++    try t.expectEqual(@as(f64, 650), j.row(0)[si].num); // c1: latest d<=4 is 2
++    try t.expectEqual(@as(f64, 550), j.row(1)[si].num); // c2: d=4
++    try t.expect(j.row(2)[si].isMissing()); // c3: no match, left join keeps it
++}
+-- 
+2.34.1
+
+
+From c5a1d31c0a39a03552c6818502a467fc115459ba Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 02:13:58 +0000
+Subject: [PATCH 2/4] =?UTF-8?q?dev:=20DONE=20GAP-optsasautos/lettrimexpand?=
+ =?UTF-8?q?ed/sqlintotrimmed=20=E2=80=94=20OPTIONS=20SASAUTOS=3D(=E2=80=A6?=
+ =?UTF-8?q?)=20multi-dir=20autocall=20+=20NOMAUTOSOURCE,=20&var=20in=20%in?=
+ =?UTF-8?q?clude=20paths,=20%LET=20trims=20expanded=20text=20(sysfunc=20ed?=
+ =?UTF-8?q?ge=20blanks=20kept),=20PROC=20SQL=20INTO=20=E2=80=A6=20TRIMMED?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/macro.zig | 167 +++++++++++++++++++++++++++++++++++++++++++-------
+ src/main.zig  |   3 +
+ src/sql.zig   |  29 +++++++++
+ 3 files changed, 176 insertions(+), 23 deletions(-)
+
+diff --git a/src/macro.zig b/src/macro.zig
+index 5610887..202d2ab 100644
+--- a/src/macro.zig
++++ b/src/macro.zig
+@@ -493,13 +493,62 @@ const State = struct {
+     }
+ };
+ 
+-/// Autocall (SASAUTOS) directory: when an invoked macro is undefined, look for
+-/// `<dir>/<name>.sas` (case-insensitively — real autocall libraries are mixed case),
+-/// compile it (which defines the macro), and retry. Set once by the CLI from
+-/// `--sasautos`/`$SASAUTOS`; null disables autocall (the warn-and-skip path).
+-var g_sasautos: ?[]const u8 = null;
++/// Autocall (SASAUTOS) directories, searched in order: when an invoked macro is
++/// undefined, look for `<dir>/<name>.sas` (case-insensitively — real autocall
++/// libraries are mixed case), compile it (which defines the macro), and retry.
++/// Seeded by the CLI from `--sasautos`/`$SASAUTOS`; `OPTIONS SASAUTOS=(…)` in
++/// the program replaces the list (GAP-optsasautos), with the bare keyword
++/// `SASAUTOS` inside the list standing for the directories in force before the
++/// statement, exactly as SAS documents it. Empty disables autocall (the
++/// warn-and-skip path).
++var g_sasautos: []const []const u8 = &.{};
++var g_cli_sasautos: [1][]const u8 = undefined;
+ pub fn setAutocallDir(dir: ?[]const u8) void {
+-    g_sasautos = dir;
++    if (dir) |d| {
++        g_cli_sasautos[0] = d;
++        g_sasautos = g_cli_sasautos[0..];
++    } else g_sasautos = &.{};
++}
++
++/// `SASAUTOS=` value parser for applyOptionsStmt: `SASAUTOS="dir"`,
++/// `SASAUTOS=(“dir1” 'dir2' SASAUTOS)`. Quoted entries are directories (with
++/// `&var` references already resolved by the ordinary scan — the option text
++/// process() hands over is pre-resolution, so they are resolved here); the bare
++/// word SASAUTOS splices in the current list. Any other bare word is a fileref,
++/// which the macro layer cannot see → loud error, list left unchanged.
++fn parseSasautos(st: *State, text: []const u8, from: usize) Error!void {
++    var p = from;
++    while (p < text.len and (text[p] == ' ' or text[p] == '\t' or text[p] == '=')) p += 1;
++    const paren = p < text.len and text[p] == '(';
++    if (paren) p += 1;
++    var dirs: std.ArrayList([]const u8) = .empty;
++    while (p < text.len) {
++        while (p < text.len and std.ascii.isWhitespace(text[p])) p += 1;
++        if (p >= text.len) break;
++        const c = text[p];
++        if (c == ')') break;
++        if (c == '\'' or c == '"') {
++            p += 1;
++            const s = p;
++            while (p < text.len and text[p] != c) p += 1;
++            try dirs.append(st.a, try resolveText(st, text[s..p]));
++            if (p < text.len) p += 1;
++        } else if (isNameStart(c)) {
++            const s = p;
++            while (p < text.len and isNameChar(text[p])) p += 1;
++            const w = text[s..p];
++            if (!eqi(w, "sasautos")) {
++                try st.diags.macroErr(0, "SASAUTOS=: fileref {s} is not supported here — give the directory as a quoted path", .{w});
++                return;
++            }
++            try dirs.appendSlice(st.a, g_sasautos);
++        } else {
++            try st.diags.macroErr(0, "SASAUTOS=: unexpected '{c}' in the directory list", .{c});
++            return;
++        }
++        if (!paren) break; // unparenthesized form takes exactly one entry
++    }
++    g_sasautos = try dirs.toOwnedSlice(st.a);
+ }
+ 
+ /// Expand `src` into arena-owned text with all macro constructs resolved.
+@@ -1064,7 +1113,7 @@ fn process(st: *State, src: []const u8, out: *std.ArrayList(u8)) Error!void {
+                     while (e < src.len and src[e] != q) e += 1;
+                 }
+             }
+-            applyOptionsStmt(st, src[i..e]);
++            try applyOptionsStmt(st, src[i..e]);
+             // Do NOT consume the statement: it used to be copied to `out`
+             // verbatim, which bypassed the ordinary scan — so an `&ref` in an
+             // OPTIONS statement was never resolved (`%let v=nodate; options
+@@ -1118,11 +1167,12 @@ fn stmtKw(src: []const u8, i: usize, word: []const u8) bool {
+     return after >= src.len or !isNameChar(src[after]);
+ }
+ 
+-/// Scan an `OPTIONS …` statement body (sans `;`) for the macro-expression
++/// Scan an `OPTIONS …` statement body (sans `;`) for the macro-processor
+ /// system options (BUG-minoperatoropt): MINOPERATOR/NOMINOPERATOR toggle the
+-/// `in`/`#` gate; MINDELIMITER='c' sets its list delimiter. Every other option
+-/// is the executor's business — the statement text passes through untouched.
+-fn applyOptionsStmt(st: *State, stmt: []const u8) void {
++/// `in`/`#` gate; MINDELIMITER='c' sets its list delimiter; SASAUTOS= sets the
++/// autocall search list (GAP-optsasautos). Every other option is the
++/// executor's business — the statement text passes through untouched.
++fn applyOptionsStmt(st: *State, stmt: []const u8) Error!void {
+     var i: usize = 0;
+     while (i < stmt.len) {
+         if (isNameStart(stmt[i])) {
+@@ -1136,6 +1186,20 @@ fn applyOptionsStmt(st: *State, stmt: []const u8) void {
+             } else if (eqi(w, "mindelimiter")) {
+                 var ignored: usize = undefined;
+                 if (parseMindelim(st, stmt, i, &ignored)) |d| st.mindelimiter = d;
++            } else if (eqi(w, "nomautosource")) {
++                g_sasautos = &.{}; // autocall off: undefined macros warn-and-skip
++            } else if (eqi(w, "sasautos")) {
++                try parseSasautos(st, stmt, i);
++                // step past the value so its quoted entries are not rescanned as words
++                while (i < stmt.len and (stmt[i] == ' ' or stmt[i] == '\t' or stmt[i] == '=')) i += 1;
++                if (i < stmt.len and stmt[i] == '(') {
++                    while (i < stmt.len and stmt[i] != ')') i += 1;
++                } else if (i < stmt.len and (stmt[i] == '\'' or stmt[i] == '"')) {
++                    const q = stmt[i];
++                    i += 1;
++                    while (i < stmt.len and stmt[i] != q) i += 1;
++                }
++                if (i < stmt.len) i += 1;
+             }
+         } else i += 1;
+     }
+@@ -1371,7 +1435,7 @@ fn handlePercent(st: *State, src: []const u8, at: usize, out: *std.ArrayList(u8)
+     // `<name>.sas` under the autocall dir. Load+compile it, then retry as a
+     // normal call. If it stays undefined (no file / bad file), fall through to
+     // the warn-and-skip below.
+-    if (g_sasautos != null and try tryAutocall(st, word)) {
++    if (g_sasautos.len != 0 and try tryAutocall(st, word)) {
+         return handleCall(st, src, j, word, out);
+     }
+ 
+@@ -1395,7 +1459,7 @@ fn handlePercent(st: *State, src: []const u8, at: usize, out: *std.ArrayList(u8)
+ /// silent (caller falls back to warn-and-skip); a file that fails to compile is
+ /// surfaced as a diagnostic naming the autocall file — never a crash.
+ fn tryAutocall(st: *State, word: []const u8) Error!bool {
+-    const dir_path = g_sasautos orelse return false;
++    if (g_sasautos.len == 0) return false;
+     const key = try lowerDup(st.a, word);
+     if (st.autoload_attempted.contains(key)) return st.getMacro(word) != null;
+     try st.autoload_attempted.put(st.a, key, {});
+@@ -1409,14 +1473,14 @@ fn tryAutocall(st: *State, word: []const u8) Error!bool {
+     const uname = try upperDup(st.a, word);
+     var text: ?[]const u8 = null;
+     var name: []const u8 = "";
+-    for ([_][]const u8{ word, lname, uname }) |cand| {
++    outer: for (g_sasautos) |dir_path| for ([_][]const u8{ word, lname, uname }) |cand| {
+         const full = try std.fmt.allocPrint(st.a, "{s}/{s}.sas", .{ dir_path, cand });
+         if (readFileText(st.a, full)) |t| {
+             text = t;
+             name = try std.fmt.allocPrint(st.a, "{s}.sas", .{cand});
+-            break;
++            break :outer;
+         }
+-    }
++    };
+     if (text == null) return false; // no file in any casing → caller warn-skips
+     // Compile into a scratch buffer (discarded): the side effect is the macro
+     // definition landing in st.macros. process() only surfaces allocator errors,
+@@ -1442,9 +1506,11 @@ fn upperDup(a: std.mem.Allocator, s: []const u8) Error![]const u8 {
+ /// `%include "file" [/options];` — splice the included file's source at this site
+ /// (recursively processed, so its own `%include`/macros/`&vars` resolve in the
+ /// same scope). Options such as `/nosource` are accepted and ignored. A path is a
+-/// quoted "file"/'file' or a bare token; a missing file is a loud ERROR (SAS 9.4
+-/// treats a missing include as a hard failure — dropping the code it was meant to
+-/// contribute is silent-wrong). The include path resolves against the CWD.
++/// quoted "file"/'file' or a bare token, with `&var` references resolved (the
++/// `%include "&root/lib/x.sas"` idiom — GAP-includemacrovar); a missing file is a
++/// loud ERROR (SAS 9.4 treats a missing include as a hard failure — dropping the
++/// code it was meant to contribute is silent-wrong). The include path resolves
++/// against the CWD.
+ fn handleInclude(st: *State, src: []const u8, from: usize, out: *std.ArrayList(u8)) Error!usize {
+     var k = skipWs(src, from);
+     var path: []const u8 = "";
+@@ -1453,12 +1519,12 @@ fn handleInclude(st: *State, src: []const u8, from: usize, out: *std.ArrayList(u
+         k += 1;
+         const ps = k;
+         while (k < src.len and src[k] != q) k += 1;
+-        path = src[ps..k];
++        path = if (q == '"') try resolveText(st, src[ps..k]) else src[ps..k];
+         if (k < src.len) k += 1; // closing quote
+     } else {
+         const ps = k;
+         while (k < src.len and src[k] != ';' and src[k] != '/' and !std.ascii.isWhitespace(src[k])) k += 1;
+-        path = src[ps..k];
++        path = try resolveText(st, src[ps..k]);
+     }
+     // swallow any trailing options (`/nosource`, `/source2`, …) up to the `;`
+     while (k < src.len and src[k] != ';') k += 1;
+@@ -1629,7 +1695,10 @@ fn handleLet(st: *State, src: []const u8, from: usize) Error!usize {
+         if (st.macro_call_depth > 0) st.returning = true;
+         return if (k < src.len) k + 1 else k;
+     }
+-    const val = try resolveText(st, std.mem.trim(u8, src[vs..k], " \t\r\n"));
++    // SAS strips leading/trailing blanks from the value AFTER resolution too:
++    // a function-style macro whose body starts on the line after `%macro m;`
++    // yields "\n  7" and `%let n=%m;` must store "7", not a newline-led value.
++    const val = std.mem.trim(u8, try resolveText(st, std.mem.trim(u8, src[vs..k], " \t\r\n")), " \t\r\n");
+     // BUG-macrobareletscope: a bare %let of a BRAND-NEW name inside a macro is
+     // LOCAL to that invocation in SAS 9.4 (was leaking to global). A name any
+     // active scope already owns (findLocal — %local/param/earlier auto-local,
+@@ -2841,7 +2910,19 @@ fn handleSysfunc(st: *State, src: []const u8, from: usize, out: *std.ArrayList(u
+     // %QSYSFUNC quotes its RESULT (F2): mask every &/% (and comma) so a later
+     // reference can't re-resolve them — mirrors the Q-form macro fns (%qscan/…).
+     // Plain %sysfunc returns the result unmasked (SAS does not quote it).
+-    try out.appendSlice(st.a, if (quote) try maskTriggers(st.a, result) else result);
++    // Edge blanks of the RESULT are the exception: SAS keeps them through %LET
++    // (`%let d=%sysfunc(putn(&x,dollar12.2))` famously carries its leading
++    // blanks — hence the -L / %left idiom), while %LET strips the blanks of
++    // ordinary expanded text. Mask them so the %LET trim leaves them alone.
++    const body = if (quote) try maskTriggers(st.a, result) else result;
++    const lead = body.len - std.mem.trimStart(u8, body, " ").len;
++    const trail = if (lead == body.len) 0 else body.len - std.mem.trimEnd(u8, body, " ").len;
++    if (lead + trail > 0) {
++        const masked = try st.a.dupe(u8, body);
++        @memset(masked[0..lead], mask_blank);
++        @memset(masked[body.len - trail ..], mask_blank);
++        try out.appendSlice(st.a, masked);
++    } else try out.appendSlice(st.a, body);
+     return pa.end;
+ }
+ 
+@@ -6834,3 +6915,43 @@ test "BUG-sysfuncmissingdot: %sysfunc maps bare `.`/`.A`–`.Z` to numeric missi
+     try std.testing.expectEqualStrings("4", try expand(a, "%sysfunc(sum(1,.,3))", &d4));
+     try std.testing.expectEqualStrings("", try d4.render());
+ }
++
++test "GAP-optsasautos: OPTIONS SASAUTOS=(\"dir\" SASAUTOS) sets the autocall search list; &var in the path and in %include resolve" {
++    setAutocallDir(null);
++    defer setAutocallDir(null);
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var diags = diag.Diagnostics.init(a);
++    // no list yet → %greet warn-skips; after OPTIONS it autocalls from tests/autocall;
++    // the bare SASAUTOS keyword keeps the previous list (here: nothing) — no error.
++    const out = try expand(a,
++        "%let root=tests;%greet(A) options mautosource sasautos=(\"&root/autocall\" SASAUTOS) mprint;%greet(B)", &diags);
++    try std.testing.expectEqualStrings(
++        " options mautosource sasautos=(\"tests/autocall\" SASAUTOS) mprint;data _null_;put \"Hello B\";run;",
++        out,
++    );
++    try std.testing.expectEqualStrings("WARNING: Apparent invocation of macro GREET not resolved.\n", try diags.render());
++    try std.testing.expectEqual(@as(usize, 1), g_sasautos.len);
++
++    // %include "&root/…" resolves the reference before opening the file
++    var d2 = diag.Diagnostics.init(a);
++    const inc = try expand(a, "%let root=tests;%include \"&root/autocall/greet.sas\";%greet(C)", &d2);
++    try std.testing.expectEqualStrings("", try d2.render());
++    try std.testing.expect(std.mem.indexOf(u8, inc, "Hello C") != null);
++
++    // a fileref in the list is beyond the macro layer → loud, list unchanged
++    var d3 = diag.Diagnostics.init(a);
++    _ = try expand(a, "options sasautos=(myref);", &d3);
++    try std.testing.expect(d3.hasErrors());
++    try std.testing.expectEqual(@as(usize, 1), g_sasautos.len);
++    // NOMAUTOSOURCE switches autocall off
++    var d4 = diag.Diagnostics.init(a);
++    _ = try expand(a, "options nomautosource;", &d4);
++    try std.testing.expectEqual(@as(usize, 0), g_sasautos.len);
++}
++
++test "BUG-lettrimexpanded: %let strips leading/trailing blanks AFTER resolution (function-style macro with a body-first newline)" {
++    // `%macro m;\n  7 %mend;` expands to "\n  7 " — SAS's %LET stores "7".
++    try expectExpand("%macro m;\n  7 %mend;%let x = %m;[&x]", "[7]");
++}
+diff --git a/src/main.zig b/src/main.zig
+index e4b4f14..a01ce73 100644
+--- a/src/main.zig
++++ b/src/main.zig
+@@ -1821,6 +1821,9 @@ fn isInertOption(name: []const u8) bool {
+         "serror",       "noserror",    "quotelenmax", "noquotelenmax",
+         "minoperator",  "nominoperator", "mindelimiter", "mstored",  "nomstored",
+         "sasmstore",
++        // autocall: SASAUTOS= is applied by the macro processor at scan time
++        // (macro.zig applyOptionsStmt); MAUTOSOURCE is opensas's only mode
++        "sasautos",     "mautosource", "nomautosource",
+         // case translation (opensas names are case-insensitive throughout)
+         "caps",         "nocaps",
+         // session/storage tuning: no observable effect on values or listings
+diff --git a/src/sql.zig b/src/sql.zig
+index d509e39..477d1d2 100644
+--- a/src/sql.zig
++++ b/src/sql.zig
+@@ -1908,6 +1908,14 @@ fn parseQuery(arena: std.mem.Allocator, toks: []const Token) !Query {
+                 i += 1;
+             }
+         }
++        // `TRIMMED` strips leading/trailing blanks from the stored value — which
++        // writeInto already does for every INTO target — so the keyword is
++        // accepted as a no-op. NOTRIM (keep the padding) is not implemented.
++        if (atKw(toks, i, "trimmed")) i += 1;
++        if (atKw(toks, i, "notrim")) {
++            unsupported("PROC SQL: INTO … NOTRIM is not supported");
++            return error.ParseError;
++        }
+         q.into = try names.toOwnedSlice(arena);
+     }
+ 
+@@ -9703,3 +9711,24 @@ test "BUG-sqljoinonsubq: JOIN ON with a scalar subquery correlated to the joined
+     try t.expectEqual(@as(f64, 550), j.row(1)[si].num); // c2: d=4
+     try t.expect(j.row(2)[si].isMissing()); // c3: no match, left join keeps it
+ }
++
++test "GAP-sqlintotrimmed: INTO :mv TRIMMED is accepted (values are stored trimmed); NOTRIM fails loud" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var lib = Library.init(a);
++    const d = try a.create(Dataset);
++    d.* = Dataset.init(a, "d");
++    _ = try d.addColumn("x", .num);
++    try d.appendRow(&.{numV(1)});
++    try d.appendRow(&.{numV(2)});
++    try lib.put("d", d);
++    var diags = diag.Diagnostics.init(a);
++    try runSql(a, &lib, &diags, "proc sql noprint; select count(*) into :n trimmed from d; quit;");
++    try t.expect(!diags.hasErrors());
++    try t.expectEqualStrings("2", lib.macroVar("n").?);
++    g_test_last_unsup = "";
++    try runSql(a, &lib, &diags, "proc sql noprint; select count(*) into :m notrim from d; quit;");
++    try t.expect(g_test_last_unsup.len > 0); // parseQuery refuses it → the SELECT is reported unsupported
++    try t.expect(lib.macroVar("m") == null);
++}
+-- 
+2.34.1
+
+
+From 3cb3b042e9e423715bc09adf183292c75dfca50f Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 02:22:34 +0000
+Subject: [PATCH 3/4] =?UTF-8?q?dev:=20DONE=20GAP-macroheadercomment=20?=
+ =?UTF-8?q?=E2=80=94=20block=20comment=20between=20%MACRO=20name=20and=20i?=
+ =?UTF-8?q?ts=20parameter=20list=20is=20skipped?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/macro.zig | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/macro.zig b/src/macro.zig
+index 202d2ab..0602038 100644
+--- a/src/macro.zig
++++ b/src/macro.zig
+@@ -1898,7 +1898,9 @@ fn handleMacro(st: *State, src: []const u8, from: usize) Error!usize {
+     const ns = k;
+     while (k < src.len and isNameChar(src[k])) k += 1;
+     const name = src[ns..k];
+-    k = skipWs(src, k);
++    // A `/* … */` block may sit between the name and `(` — the classic
++    // utility-macro header style puts the doc comment there.
++    k = skipWsc(src, k);
+ 
+     var params: std.ArrayList(Param) = .empty;
+     if (k < src.len and src[k] == '(') {
+@@ -6955,3 +6957,7 @@ test "BUG-lettrimexpanded: %let strips leading/trailing blanks AFTER resolution
+     // `%macro m;\n  7 %mend;` expands to "\n  7 " — SAS's %LET stores "7".
+     try expectExpand("%macro m;\n  7 %mend;%let x = %m;[&x]", "[7]");
+ }
++
++test "GAP-macroheadercomment: a block comment between the macro name and its parameter list is skipped" {
++    try expectExpand("%macro m\n/*---\ndoc block\n---*/\n(a, b=2)/minoperator;[&a:&b]%mend;%m(1)", "[1:2]");
++}
+-- 
+2.34.1
+
+
+From f60aed943b0272c7ec001bbffc4d49980335d669 Mon Sep 17 00:00:00 2001
+From: Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 02:35:39 +0000
+Subject: [PATCH 4/4] =?UTF-8?q?dev:=20DONE=20BUG-sqlaggcalcarg=20=E2=80=94?=
+ =?UTF-8?q?=20an=20aggregate=20over=20a=20CALCULATED=20non-aggregate=20ali?=
+ =?UTF-8?q?as=20folds=20the=20alias's=20expression=20per=20row=20(was=20mi?=
+ =?UTF-8?q?ssing)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/sql.zig | 145 +++++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 137 insertions(+), 8 deletions(-)
+
+diff --git a/src/sql.zig b/src/sql.zig
+index 477d1d2..72eac53 100644
+--- a/src/sql.zig
++++ b/src/sql.zig
+@@ -1875,6 +1875,7 @@ fn parseQuery(arena: std.mem.Allocator, toks: []const Token) !Query {
+             i = parsed.next;
+             if (atTag(toks, i, .comma)) i += 1;
+         }
++        try inlineCalculatedInAggArgs(arena, items.items);
+         q.items = try items.toOwnedSlice(arena);
+     }
+ 
+@@ -2243,6 +2244,73 @@ fn parseItem(arena: std.mem.Allocator, toks: []const Token, start: usize) !struc
+ }
+ 
+ /// True when `span` is exactly one `case … end` (its `case` closes at the last token).
++
++/// `sum(bal * calculated rw)` where `rw` is an earlier NON-aggregate SELECT item
++/// (a CASE or an arithmetic expression): the aggregate folds per source row, where
++/// no output alias is bound, so the reference resolved to a missing column and
++/// the whole aggregate silently came out missing (BUG-sqlaggcalcarg). SAS
++/// evaluates the alias's expression per row inside the fold. Inline the item's
++/// tokens in place of `calculated <alias>` — `( expr )` for an expression item,
++/// `case … end` for a CASE item — so computeAggExpr sees a self-contained
++/// argument. A reference to an AGGREGATE alias is inlined as its `agg(…)` call so
++/// computeAggExpr's nested-summary check reports it the way SAS does.
++fn inlineCalculatedInAggArgs(arena: std.mem.Allocator, items: []Item) !void {
++    for (items, 0..) |*it, k| {
++        const arg = it.agg_arg orelse continue;
++        if (!hasCalc(arg)) continue;
++        var out: std.ArrayList(Token) = .empty;
++        var changed = false;
++        var i: usize = 0;
++        while (i < arg.len) : (i += 1) {
++            if (tkKw(arg[i], "calculated") and i + 1 < arg.len and arg[i + 1].tag == .name) {
++                if (findAliasItem(items[0..k], arg[i + 1].text)) |src| {
++                    const line = arg[i].line;
++                    if (src.agg) |f| {
++                        try out.append(arena, .{ .tag = .name, .text = @tagName(f), .line = line });
++                        try out.append(arena, .{ .tag = .lparen, .text = "(", .line = line });
++                        if (src.agg_star) {
++                            try out.append(arena, .{ .tag = .star, .text = "*", .line = line });
++                        } else if (src.agg_arg) |aa| {
++                            try out.appendSlice(arena, aa);
++                        } else if (src.col) |c| {
++                            try out.append(arena, .{ .tag = .name, .text = c, .line = line });
++                        }
++                        try out.append(arena, .{ .tag = .rparen, .text = ")", .line = line });
++                    } else if (src.case_toks) |ct| {
++                        try out.append(arena, .{ .tag = .name, .text = "case", .line = line });
++                        try out.appendSlice(arena, try removeCalculated(arena, ct));
++                        try out.append(arena, .{ .tag = .name, .text = "end", .line = line });
++                    } else if (src.expr_toks) |et| {
++                        try out.append(arena, .{ .tag = .lparen, .text = "(", .line = line });
++                        try out.appendSlice(arena, try removeCalculated(arena, et));
++                        try out.append(arena, .{ .tag = .rparen, .text = ")", .line = line });
++                    } else if (src.col) |c| {
++                        try out.append(arena, .{ .tag = .name, .text = c, .line = line });
++                    } else continue;
++                    changed = true;
++                    i += 1; // the alias token
++                    continue;
++                }
++            }
++            try out.append(arena, arg[i]);
++        }
++        if (changed) it.agg_arg = out.items;
++    }
++}
++
++/// The earlier SELECT item that `alias` names (last definition wins, as when the
++/// PDV is bound in order).
++fn findAliasItem(items: []const Item, alias: []const u8) ?Item {
++    var found: ?Item = null;
++    for (items) |it| {
++        if (it.alias) |a| if (eqi(a, alias)) {
++            found = it;
++        };
++    }
++    if (found) |it| if (!it.is_star) return it;
++    return null;
++}
++
+ fn isPureCase(span: []const Token) bool {
+     if (span.len < 2 or !tkKw(span[0], "case")) return false;
+     var depth: usize = 0;
+@@ -3434,14 +3502,30 @@ fn computeAggExpr(arena: std.mem.Allocator, diags: *diag.Diagnostics, ds: *Datas
+     } else {
+         var pdv = Pdv.init(arena);
+         var ev: eval.Evaluator = .{ .arena = arena, .pdv = &pdv, .diags = diags, .call_fn = &sqlDispatch };
+-        var wp = pe.Parser.init(arena, try withEof(arena, arg), diags);
+-        const expr = wp.parseExpr() catch {
+-            unsupported("PROC SQL: unsupported aggregate argument expression");
+-            return Value.missing;
+-        };
+-        for (grp, 0..) |ri, k| {
+-            try loadForEval(&pdv, ds, ds.row(ri));
+-            vals[k] = ev.eval(expr) catch Value.missing;
++        if (hasCase(arg)) {
++            // an embedded `case … end` (e.g. an inlined CALCULATED alias —
++            // BUG-sqlaggcalcarg) is collapsed to its value per row, then the
++            // remaining arithmetic parsed and evaluated for that row
++            for (grp, 0..) |ri, k| {
++                try loadForEval(&pdv, ds, ds.row(ri));
++                const flat = try substituteCase(arena, diags, &ev, arg);
++                var wp = pe.Parser.init(arena, try withEof(arena, flat), diags);
++                const expr = wp.parseExpr() catch {
++                    unsupported("PROC SQL: unsupported aggregate argument expression");
++                    return Value.missing;
++                };
++                vals[k] = ev.eval(expr) catch Value.missing;
++            }
++        } else {
++            var wp = pe.Parser.init(arena, try withEof(arena, arg), diags);
++            const expr = wp.parseExpr() catch {
++                unsupported("PROC SQL: unsupported aggregate argument expression");
++                return Value.missing;
++            };
++            for (grp, 0..) |ri, k| {
++                try loadForEval(&pdv, ds, ds.row(ri));
++                vals[k] = ev.eval(expr) catch Value.missing;
++            }
+         }
+     }
+     if (f == .count or f == .n or f == .nmiss) {
+@@ -9732,3 +9816,48 @@ test "GAP-sqlintotrimmed: INTO :mv TRIMMED is accepted (values are stored trimme
+     try t.expect(g_test_last_unsup.len > 0); // parseQuery refuses it → the SELECT is reported unsupported
+     try t.expect(lib.macroVar("m") == null);
+ }
++
++test "aggregate over a CALCULATED non-aggregate alias folds the alias per row (BUG-sqlaggcalcarg)" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var diags = diag.Diagnostics.init(a);
++    var lib = Library.init(a);
++
++    const d = try a.create(Dataset);
++    d.* = Dataset.init(a, "d");
++    _ = try d.addColumn("g", .char);
++    _ = try d.addColumn("bal", .num);
++    for ([_]struct { g: []const u8, bal: f64 }{
++        .{ .g = "A", .bal = 100 }, .{ .g = "A", .bal = 200 }, .{ .g = "B", .bal = 50 },
++    }) |r| try d.appendRow(&.{ .{ .str = r.g }, .{ .num = r.bal } });
++    try lib.put("d", d);
++
++    // a CASE alias inside sum(): A → 300*0.5 = 150, B → 50*1 = 50 (was: missing)
++    try runSql(a, &lib, &diags,
++        \\proc sql; create table r as
++        \\ select g, case when g='A' then 0.5 else 1.0 end as rw,
++        \\        sum(bal) as tot, sum(bal * calculated rw) as rwa
++        \\ from d group by 1, 2 order by g; quit;
++    );
++    const r = lib.find("r").?;
++    try t.expectEqual(@as(usize, 2), r.rowCount());
++    try t.expectEqual(@as(f64, 150), r.row(0)[3].num);
++    try t.expectEqual(@as(f64, 50), r.row(1)[3].num);
++
++    // an arithmetic alias inside sum(): A → (100*2)+(200*2) = 600; dbl is not a
++    // group key, so the result remerges to one row per input row
++    try runSql(a, &lib, &diags,
++        \\proc sql; create table s as
++        \\ select g, bal * 2 as dbl, sum(calculated dbl) as sdbl
++        \\ from d group by g order by g; quit;
++    );
++    const s = lib.find("s").?;
++    try t.expectEqual(@as(usize, 3), s.rowCount());
++    try t.expectEqual(@as(f64, 600), s.row(0)[2].num);
++    try t.expectEqual(@as(f64, 600), s.row(1)[2].num);
++    try t.expectEqual(@as(f64, 100), s.row(2)[2].num);
++
++    // an AGGREGATE alias inside an aggregate is still the SAS nested-summary error
++    try t.expectError(error.ParseError, runSql(a, &lib, &diags, "proc sql; create table n as select g, sum(bal) as tot, sum(calculated tot) as bad from d group by g; quit;"));
++}
+-- 
+2.34.1
+

@@ -86,6 +86,19 @@ This builds the format catalog, loads `ORA_DW` / `RAW_BANK` / `CURATED` from
 against. The data is seeded to trip every exception, reject and anomaly branch in
 the code. See [Data/README.md](Data/README.md).
 
+### Without a SAS licence: the Docker runtime
+
+```bash
+docker compose -f docker/compose.yml build
+docker compose -f docker/compose.yml run --rm sas
+```
+
+Runs the same chain on [OpenSAS](https://github.com/kirha-ai/opensas) inside a container laid
+out like the production batch server (`/opt/sas/custom`, `/data/sas`, a `sas` command that
+takes `-autoexec/-sysin/-set/-log`), checks the log and the row counts, and exports every
+output table plus control totals to `/data/sas/golden/` as the baseline for reconciling a
+migrated target. See [docker/README.md](docker/README.md).
+
 ## External Dependencies
 
 Production dependencies. Each is either stubbed or seeded from `Data/` when the
