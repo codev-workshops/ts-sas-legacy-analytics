@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# sas — SAS 9.4-style command-line front end for the OpenSAS interpreter.
+#
+# The legacy batch jobs and Data/bootstrap_local_env.sh invoke SAS the way a
+# real site does:
+#
+#   sas -nodms -noterminal -autoexec <file> -set NAME VALUE ... \
+#       -sysin <program> -log <file> -print <file>
+#
+# OpenSAS takes a single program path and writes the log to stdout, so this
+# wrapper translates the conventional flags:
+#
+#   -sysin FILE           program to run (a bare FILE argument also works)
+#   -autoexec FILE        prepended to the program (SAS runs it first)
+#   -set NAME VALUE       exported so %sysget(NAME) resolves
+#   -log FILE             log (stdout of the interpreter) is tee'd here
+#   -print FILE           listing output (opensas writes it to the log stream;
+#                         the file is created so callers that expect it succeed)
+#   -sasautos DIR         autocall directory (the interpreter takes one; the
+#                         autoexec's OPTIONS SASAUTOS=(...) can add more)
+#   -nodms -noterminal -batch -nonews -noovp -nosyntaxcheck -nodate -nonumber
+#                         accepted and ignored (batch-mode/no-op in a container)
+#   -help                 this text
+#
+# Anything else is rejected loudly (the interpreter would otherwise treat an
+# unknown flag as a program file). Exit status is the interpreter's.
+
+set -uo pipefail
+
+OPENSAS_BIN="${OPENSAS_BIN:-/usr/local/libexec/opensas/sas}"
+
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }
+
+die() { echo "sas: $*" >&2; exit 2; }
+
+sysin=""; autoexec=""; log=""; print=""; sasautos=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -sysin)     [ $# -ge 2 ] || die "-sysin needs a file"; sysin="$2"; shift 2 ;;
+    -autoexec)  [ $# -ge 2 ] || die "-autoexec needs a file"; autoexec="$2"; shift 2 ;;
+    -log)       [ $# -ge 2 ] || die "-log needs a file"; log="$2"; shift 2 ;;
+    -print)     [ $# -ge 2 ] || die "-print needs a file"; print="$2"; shift 2 ;;
+    -sasautos)  [ $# -ge 2 ] || die "-sasautos needs a directory"; sasautos="$2"; shift 2 ;;
+    -set)       [ $# -ge 3 ] || die "-set needs NAME VALUE"; export "$2=$3"; shift 3 ;;
+    -nodms|-noterminal|-batch|-nonews|-noovp|-nosyntaxcheck|-nodate|-nonumber|-nocenter|-nosplash|-noxwait|-noxsync)
+                shift ;;
+    -help|--help|-h) usage; exit 0 ;;
+    -*)         die "option '$1' is not supported by the container runtime (run 'sas -help')" ;;
+    *)          [ -z "$sysin" ] || die "more than one program given: '$sysin' and '$1'"
+                sysin="$1"; shift ;;
+  esac
+done
+
+[ -n "$sysin" ] || die "no program given (use -sysin FILE)"
+[ -r "$sysin" ] || die "cannot read program '$sysin'"
+[ -z "$autoexec" ] || [ -r "$autoexec" ] || die "cannot read autoexec '$autoexec'"
+[ -x "$OPENSAS_BIN" ] || die "interpreter not found at $OPENSAS_BIN"
+
+# Autocall search path: explicit -sasautos, else the interpreter reads $SASAUTOS.
+autos=()
+[ -z "$sasautos" ] || autos=(--sasautos "$sasautos")
+
+# SAS runs the autoexec in the same session before SYSIN. OpenSAS has one
+# program per run, so concatenate them with a %include so the log shows where
+# the autoexec ends and the job begins.
+work="$(mktemp -d "${TMPDIR:-/tmp}/sas.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+prog="$work/$(basename "$sysin")"
+{
+  if [ -n "$autoexec" ]; then
+    printf '%%include "%s";\n' "$autoexec"
+  fi
+  printf '%%include "%s";\n' "$sysin"
+} > "$prog"
+
+for f in "$log" "$print"; do
+  [ -z "$f" ] || { mkdir -p "$(dirname "$f")" && : > "$f"; } || die "cannot write '$f'"
+done
+
+if [ -n "$log" ]; then
+  "$OPENSAS_BIN" "${autos[@]}" "$prog" 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+else
+  "$OPENSAS_BIN" "${autos[@]}" "$prog" 2>&1
+  rc=$?
+fi
+exit "$rc"

@@ -1,0 +1,36 @@
+# Legacy SAS runtime for the banking estate.
+#
+#   docker compose -f docker/compose.yml build
+#   docker compose -f docker/compose.yml run --rm sas               # full banking run + golden export
+#   docker compose -f docker/compose.yml run --rm sas bash          # poke around like on the SAS server
+#   docker compose -f docker/compose.yml run --rm sas sas -help     # the SAS-style CLI
+#
+# Outputs land in the `sasdata` volume (/data/sas). To read them from the host:
+#   docker compose -f docker/compose.yml run --rm -v "$PWD/out:/out" sas cp -r /data/sas/golden /out/
+#
+# The estate is baked into the image (a real SAS server has it on disk). For
+# live editing of programs without a rebuild, uncomment the bind mounts.
+
+name: ts-sas-legacy
+
+services:
+  sas:
+    image: ts-sas-legacy-analytics/sas:local
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        ESTATE_COMMIT: ${ESTATE_COMMIT:-unknown}
+    environment:
+      SAS_REPO_ROOT: /opt/sas/custom
+      SAS_DATA_ROOT: /data/sas
+    volumes:
+      - sasdata:/data/sas
+      # - ../Programs:/opt/sas/custom/Programs:ro
+      # - ../Data:/opt/sas/custom/Data:ro
+      # - ../Config:/opt/sas/custom/Config:ro
+      # - ../Formats:/opt/sas/custom/Formats:ro
+    command: ["run-banking"]
+
+volumes:
+  sasdata:
