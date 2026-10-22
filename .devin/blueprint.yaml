@@ -1,0 +1,15 @@
+# https://docs.devin.ai/onboard-devin/environment-yaml
+# Pure SAS codebase — no installable dependencies. Knowledge-only blueprint.
+knowledge:
+  - name: notes
+    contents: |
+      Enterprise SAS estate for banking and insurance analytics migration exercises.
+      Config/ — autoexec.sas (LIBNAMEs, macro vars, DB connections).
+      Formats/ — banking_formats.sas, insurance_formats.sas (PROC FORMAT catalogs).
+      Macro/ — 92 reusable SAS utility macros.
+      Programs/Banking/ — account loading, transaction ETL, credit risk scoring, regulatory reporting.
+      Programs/Insurance/ — claims processing, policy valuation.
+      Programs/Reports/ — customer profitability P&L.
+      BatchJobs/ — run_daily_banking.sas, run_daily_insurance.sas (master orchestrators).
+      External deps: Oracle DW, Teradata, Control-M, SMTP.
+      Related repos: uc-data-migration-sas-to-databricks (dbt/Databricks target), uc-data-migration-sas-to-snowflake (Snowflake validation toolkit).
